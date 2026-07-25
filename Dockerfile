@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # ffmpeg + python3/pip (yt-dlp için) kur
 RUN apt-get update && \
