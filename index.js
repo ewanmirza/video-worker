@@ -1,4 +1,5 @@
 const express = require("express");
+const cors = require("cors");
 const { spawnSync } = require("child_process");
 const fs = require("fs");
 const os = require("os");
@@ -6,6 +7,7 @@ const path = require("path");
 const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
+app.use(cors()); // tarayıcıdan (Vercel sitesi) doğrudan çağrılabilmesi için
 const PORT = process.env.PORT || 3000;
 
 const API_BASE = process.env.API_BASE;
@@ -40,6 +42,47 @@ app.get("/run-job", async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`worker listening on ${PORT}`));
+
+// Uzun videolarda otomatik kesim noktası önerisi (sahne değişimi tespiti)
+app.get("/detect-scenes", async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "url gerekli" });
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "vf-scan-"));
+  try {
+    const rawPath = path.join(workDir, "raw.mp4");
+    downloadVideo(url, rawPath);
+
+    // toplam süreyi al
+    const probe = spawnSync("ffprobe", [
+      "-v", "error",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      rawPath,
+    ]);
+    const duration = parseFloat(probe.stdout.toString().trim()) || 0;
+
+    // sahne değişimi tespiti: ffmpeg select filter, eşik 0.35
+    const result = spawnSync("ffmpeg", [
+      "-i", rawPath,
+      "-filter:v", "select='gt(scene,0.35)',showinfo",
+      "-f", "null", "-",
+    ]);
+    const stderr = result.stderr.toString();
+    const matches = [...stderr.matchAll(/pts_time:([\d.]+)/g)];
+    const scenes = matches.map((m) => parseFloat(m[1])).filter((n) => !isNaN(n));
+
+    res.json({ duration, scenes });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+});
 
 async function processNextJob() {
   const jobRes = await fetch(`${API_BASE}/api/jobs/next`, {
