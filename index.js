@@ -175,9 +175,13 @@ async function processWithPersistentOverlay(project, workDir, rawItems, isMultic
     const duration = Math.max(0.5, Math.min(end - start, 15));
 
     const outPath = path.join(workDir, `trim_${i}.mp4`);
+    // concat demuxer tüm parçalarda aynı stream yapısını bekler, bu yüzden
+    // sessize alma için stream'i kaldırmak yerine (-an) seviyeyi 0 yapıyoruz
+    const volumeLevel = it.audio_muted ? 0 : (it.audio_volume ?? 100) / 100;
     run("ffmpeg", [
       "-y", "-ss", String(start), "-i", rawPath, "-t", String(duration),
       "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+      "-filter:a", `volume=${volumeLevel}`,
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac",
       outPath,
     ]);
@@ -237,13 +241,112 @@ async function processWithPersistentOverlay(project, workDir, rawItems, isMultic
     );
   });
 
-  const finalPath = path.join(workDir, "final.mp4");
+  const textLayers = (project.overlay_layers || []).filter((l) => l.layer_type === "text");
+  const imageLayers = (project.overlay_layers || []).filter((l) => l.layer_type === "image");
+
+  textLayers.forEach((l) => {
+    const x = Math.round((l.overlay_x / 100) * CANVAS_W);
+    const y = Math.round((l.overlay_y / 100) * CANVAS_H);
+    const color = `0x${(l.overlay_color || "#E8973A").replace("#", "")}`;
+    const font = FONT_MAP[l.overlay_font] || FONT_MAP.Oswald;
+    const safeText = String(l.content).replace(/'/g, "\\'").replace(/:/g, "\\:");
+    const enable =
+      l.end_time != null
+        ? `:enable='between(t\\,${l.start_time}\\,${l.end_time})'`
+        : l.start_time
+        ? `:enable='gte(t\\,${l.start_time})'`
+        : "";
+    drawTexts.push(
+      `drawtext=fontfile=${font}:text='${safeText}':fontsize=${l.font_size || 40}:fontcolor=${color}:borderw=2:bordercolor=black:x=${x}:y=${y}${enable}`
+    );
+  });
+
+  const overlaidPath = path.join(workDir, "overlaid.mp4");
   run("ffmpeg", [
     "-y", "-i", concatPath,
     "-vf", drawTexts.join(","),
     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy",
-    finalPath,
+    overlaidPath,
   ]);
+
+  let withImagesPath = overlaidPath;
+
+  if (imageLayers.length > 0) {
+    await reportProgress(project.id, 90, "görsel katmanlar ekleniyor");
+    try {
+      const imgInputs = [];
+      for (let i = 0; i < imageLayers.length; i++) {
+        const l = imageLayers[i];
+        const imgPath = path.join(workDir, `layer_img_${i}.png`);
+        const resp = await fetch(l.content);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        fs.writeFileSync(imgPath, buf);
+        imgInputs.push({ path: imgPath, layer: l });
+      }
+
+      const args = ["-y", "-i", overlaidPath];
+      imgInputs.forEach((i) => args.push("-i", i.path));
+
+      let filter = "";
+      let lastLabel = "0:v";
+      imgInputs.forEach((i, idx) => {
+        const w = Math.round((i.layer.image_width / 100) * CANVAS_W);
+        const x = Math.round((i.layer.overlay_x / 100) * CANVAS_W);
+        const y = Math.round((i.layer.overlay_y / 100) * CANVAS_H);
+        const enable =
+          i.layer.end_time != null
+            ? `:enable='between(t\\,${i.layer.start_time}\\,${i.layer.end_time})'`
+            : i.layer.start_time
+            ? `:enable='gte(t\\,${i.layer.start_time})'`
+            : "";
+        const scaledLabel = `s${idx}`;
+        const outLabel = idx === imgInputs.length - 1 ? "vout" : `v${idx}`;
+        filter += `[${idx + 1}:v]scale=${w}:-1[${scaledLabel}];`;
+        filter += `[${lastLabel}][${scaledLabel}]overlay=${x}:${y}${enable}[${outLabel}];`;
+        lastLabel = outLabel;
+      });
+      filter = filter.slice(0, -1); // son ; işaretini kaldır
+
+      const imagedPath = path.join(workDir, "with_images.mp4");
+      run("ffmpeg", [
+        ...args,
+        "-filter_complex", filter,
+        "-map", "[vout]", "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "copy",
+        imagedPath,
+      ]);
+      withImagesPath = imagedPath;
+    } catch (e) {
+      console.error("görsel katmanlar eklenemedi, atlanıyor:", e);
+    }
+  }
+
+  let finalPath = withImagesPath;
+
+  if (project.bg_music_url) {
+    await reportProgress(project.id, 92, "arka plan müziği ekleniyor");
+    try {
+      const musicRawPath = path.join(workDir, "music_raw");
+      run("yt-dlp", ["-x", "--audio-format", "mp3", "--no-playlist", "-o", musicRawPath + ".%(ext)s", project.bg_music_url]);
+      const musicPath = musicRawPath + ".mp3";
+
+      if (fs.existsSync(musicPath)) {
+        const mixedPath = path.join(workDir, "mixed.mp4");
+        const musicVol = (project.bg_music_volume ?? 25) / 100;
+        run("ffmpeg", [
+          "-y", "-i", withImagesPath, "-stream_loop", "-1", "-i", musicPath,
+          "-filter_complex",
+          `[1:a]volume=${musicVol}[music];[0:a][music]amix=inputs=2:duration=first:dropout_transition=0[aout]`,
+          "-map", "0:v", "-map", "[aout]",
+          "-c:v", "copy", "-c:a", "aac", "-shortest",
+          mixedPath,
+        ]);
+        finalPath = mixedPath;
+      }
+    } catch (e) {
+      console.error("arka plan müziği eklenemedi, müziksiz devam ediliyor:", e);
+    }
+  }
 
   // kullanıcı bu arada iptal ettiyse yüklemeyi atla
   const check = await fetch(`${API_BASE}/api/projects?id=${project.id}`).then((r) => r.json());
@@ -265,9 +368,17 @@ async function processWithPersistentOverlay(project, workDir, rawItems, isMultic
   await reportComplete(project.id, "done", publicUrlData.publicUrl, null);
 }
 
-function downloadVideo(url, outPath) {
-  run("yt-dlp", ["-f", "mp4/best", "--no-playlist", "-o", outPath, url]);
-  if (!fs.existsSync(outPath)) throw new Error(`indirme başarısız: ${url}`);
+function downloadVideo(url, outPath, retries = 2) {
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const result = spawnSync("yt-dlp", ["-f", "mp4/best", "--no-playlist", "-o", outPath, url], {
+      stdio: "inherit",
+    });
+    if (result.status === 0 && fs.existsSync(outPath)) return;
+    lastErr = `yt-dlp exited with code ${result.status}`;
+    console.error(`indirme denemesi ${attempt}/${retries} başarısız: ${url}`);
+  }
+  throw new Error(`indirme başarısız (${retries} deneme): ${url} — ${lastErr}`);
 }
 
 async function reportComplete(projectId, status, outputUrl, error) {
