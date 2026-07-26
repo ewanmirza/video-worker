@@ -40,6 +40,48 @@ app.get("/run-job", async (req, res) => {
 
 app.listen(PORT, () => console.log(`worker listening on ${PORT}`));
 
+// Timeline'da gösterilecek kare önizlemeleri (küçük jpg'ler, base64)
+app.get("/thumbnails", async (req, res) => {
+  if (req.query.secret !== WORKER_SECRET) return res.status(401).json({ error: "unauthorized" });
+  const url = req.query.url;
+  const count = Math.min(Number(req.query.count) || 10, 20);
+  if (!url) return res.status(400).json({ error: "url gerekli" });
+
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "vf-thumbs-"));
+  try {
+    const rawPath = path.join(workDir, "raw.mp4");
+    downloadVideo(url, rawPath);
+
+    const probe = spawnSync("ffprobe", [
+      "-v", "error", "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1", rawPath,
+    ]);
+    const duration = parseFloat(probe.stdout.toString().trim()) || 10;
+
+    const thumbs = [];
+    for (let i = 0; i < count; i++) {
+      const t = (duration / count) * i;
+      const outPath = path.join(workDir, `thumb_${i}.jpg`);
+      spawnSync("ffmpeg", [
+        "-y", "-ss", String(t), "-i", rawPath,
+        "-vframes", "1", "-vf", "scale=160:-1",
+        "-q:v", "5", outPath,
+      ]);
+      if (fs.existsSync(outPath)) {
+        const b64 = fs.readFileSync(outPath).toString("base64");
+        thumbs.push(`data:image/jpeg;base64,${b64}`);
+      }
+    }
+
+    res.json({ duration, thumbs });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: String(e.message || e) });
+  } finally {
+    fs.rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 app.get("/detect-scenes", async (req, res) => {
   if (req.query.secret !== WORKER_SECRET) return res.status(401).json({ error: "unauthorized" });
   const url = req.query.url;
@@ -161,31 +203,37 @@ async function processWithPersistentOverlay(project, workDir, rawItems, isMultic
 
   await reportProgress(project.id, 85, "kalıcı numara listesi ve yazılar ekleniyor");
 
-  // sabit sıra numaraları listesi (üstten alta), her biri kendi renginde, tüm video boyunca görünür
+  // sabit sıra numaraları + başlıklar: video boyunca HEPSİ aynı anda görünür.
+  // kullanıcı serbest konum (overlay_x/overlay_y, yüzde) belirlediyse onu kullan,
+  // belirlemediyse listede sıralı (üstten alta) varsayılan konuma düş.
   const rowHeight = 110;
   const startY = 150;
+  const CANVAS_W = 1080;
+  const CANVAS_H = 1920;
   const drawTexts = [];
 
   listOrder.forEach((it, row) => {
     const label = isMulticlip ? `${it.segment_index + 1}.` : `${it.rank}.`;
     const color = `0x${(it.overlay_color || "#E8973A").replace("#", "")}`;
     const font = FONT_MAP[it.overlay_font] || FONT_MAP.Oswald;
-    const y = startY + row * rowHeight;
-    drawTexts.push(
-      `drawtext=fontfile=${font}:text='${label}':fontsize=56:fontcolor=${color}:borderw=3:bordercolor=black:x=60:y=${y}`
-    );
-  });
+    const safeCaption = String(it.caption).replace(/'/g, "\\'").replace(/:/g, "\\:");
 
-  // zamanlanmış başlıklar: yalnızca ilgili klip oynarken görünür
-  timeline.forEach((t) => {
-    const row = listOrder.findIndex((it) =>
-      isMulticlip ? `${it.segment_index + 1}.` === t.label : `${it.rank}.` === t.label
-    );
-    const y = startY + row * rowHeight + 8;
-    const safeCaption = t.caption.replace(/'/g, "\\'").replace(/:/g, "\\:");
-    const font = FONT_MAP[t.font] || FONT_MAP.Oswald;
+    let x, y;
+    if (it.overlay_x != null && it.overlay_y != null) {
+      x = Math.round((it.overlay_x / 100) * CANVAS_W);
+      y = Math.round((it.overlay_y / 100) * CANVAS_H);
+    } else {
+      x = 60;
+      y = startY + row * rowHeight;
+    }
+
+    // numara
     drawTexts.push(
-      `drawtext=fontfile=${font}:text='${safeCaption}':fontsize=40:fontcolor=white:borderw=2:bordercolor=black:x=180:y=${y}:enable='between(t\\,${t.start}\\,${t.end})'`
+      `drawtext=fontfile=${font}:text='${label}':fontsize=56:fontcolor=${color}:borderw=3:bordercolor=black:x=${x}:y=${y}`
+    );
+    // başlık (numaranın hemen sağında/altında, her zaman görünür)
+    drawTexts.push(
+      `drawtext=fontfile=${font}:text='${safeCaption}':fontsize=38:fontcolor=white:borderw=2:bordercolor=black:x=${x + 110}:y=${y + 10}`
     );
   });
 
